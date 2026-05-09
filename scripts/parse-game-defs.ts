@@ -749,11 +749,129 @@ interface TrailerData {
   chain_type: string;
   country_validity: string[];
   ownable: boolean;
+  /** Total purchase price across all accessories, rounded UP to nearest 1000. 0 if no dealer data found. */
+  price: number;
+  /** Max accessory unlock level — level at which the trailer becomes available. 0 if no dealer data found. */
+  level_floor: number;
+}
+
+interface TrailerPricing {
+  price: number;
+  level_floor: number;
+}
+
+/** Round up to nearest 1000 per #251 spec. */
+export function roundPriceUpToThousand(total: number): number {
+  return Math.ceil(total / 1000) * 1000;
+}
+
+/** Strip leading `trailer_def.` prefix; anchored — never strips mid-name. */
+export function deriveTrailerIdFromDefName(name: string): string {
+  return name.replace(/^trailer_def\./, '');
+}
+
+/**
+ * Aggregate per-trailer dealer pricing. One dealer .sii file → one trailer_def;
+ * accessories sum across all trailer blocks (parent + slave chains for
+ * double/b_double/triple). Same shape as extractTrucks().
+ */
+function extractTrailerPricing(): Map<string, TrailerPricing> {
+  const pricing = new Map<string, TrailerPricing>();
+  const dealerDir = join(defsPath, 'vehicle', 'trailer_dealer');
+  if (!existsSync(dealerDir)) return pricing;
+
+  // Resolve absolute `/def/...` data_path values relative to the extracted
+  // archive root (the parent directory of `defsPath`).
+  const archiveRoot = dirname(defsPath);
+
+  function walkSiiFiles(dir: string): string[] {
+    const out: string[] = [];
+    if (!existsSync(dir)) return out;
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        out.push(...walkSiiFiles(full));
+      } else if (entry.endsWith('.sii') || entry.endsWith('.sui')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  const accessoryFileCache = new Map<string, ParsedUnit[]>();
+  function loadAccessoryFile(absPath: string): ParsedUnit[] {
+    const cached = accessoryFileCache.get(absPath);
+    if (cached) return cached;
+    if (!existsSync(absPath)) {
+      accessoryFileCache.set(absPath, []);
+      return [];
+    }
+    const parsed = parseSiiFile(readFileSync(absPath, 'utf-8'));
+    accessoryFileCache.set(absPath, parsed);
+    return parsed;
+  }
+
+  for (const dealerFile of walkSiiFiles(dealerDir)) {
+    const units = parseSiiFile(readFileSync(dealerFile, 'utf-8'));
+
+    // First pass: find the trailer_def reference and collect accessory refs
+    // across all trailer blocks. Refs look like ".data" / ".chassis" — we
+    // strip the leading dot to match against vehicle_accessory unit names.
+    let trailerDefName = '';
+    const accessoryRefs = new Set<string>();
+
+    for (const unit of units) {
+      if (unit.type !== 'trailer') continue;
+      if (!trailerDefName && typeof unit.props.trailer_definition === 'string') {
+        trailerDefName = unit.props.trailer_definition;
+      }
+      const accs = unit.props.accessories;
+      if (Array.isArray(accs)) {
+        for (const ref of accs) {
+          accessoryRefs.add(String(ref).replace(/^\./, ''));
+        }
+      }
+    }
+
+    if (!trailerDefName || accessoryRefs.size === 0) continue;
+    const trailerId = deriveTrailerIdFromDefName(trailerDefName);
+
+    // Second pass: resolve each ref to a vehicle_accessory's data_path, load
+    // that accessory's .sii file, and pull `price` + `unlock` from any unit
+    // inside it (typically there's exactly one).
+    let totalPrice = 0;
+    let maxUnlock = 0;
+
+    for (const unit of units) {
+      if (unit.type !== 'vehicle_accessory') continue;
+      const localName = unit.name.replace(/^\./, '');
+      if (!accessoryRefs.has(localName)) continue;
+
+      const dataPath = unit.props.data_path;
+      if (typeof dataPath !== 'string') continue;
+
+      const accFile = join(archiveRoot, dataPath.replace(/^\//, ''));
+      const accUnits = loadAccessoryFile(accFile);
+      for (const accUnit of accUnits) {
+        const price = typeof accUnit.props.price === 'number' ? accUnit.props.price : 0;
+        const unlock = typeof accUnit.props.unlock === 'number' ? accUnit.props.unlock : 0;
+        totalPrice += price;
+        if (unlock > maxUnlock) maxUnlock = unlock;
+      }
+    }
+
+    if (totalPrice === 0 && maxUnlock === 0) continue;
+
+    pricing.set(trailerId, { price: roundPriceUpToThousand(totalPrice), level_floor: maxUnlock });
+  }
+
+  return pricing;
 }
 
 function extractTrailers(): TrailerData[] {
   const trailerDefsDir = join(defsPath, 'vehicle', 'trailer_defs');
   const units = readAllSiiFiles(trailerDefsDir, '.sii');
+  const pricing = extractTrailerPricing();
 
   const trailers: TrailerData[] = [];
   const seenIds = new Set<string>();
@@ -761,11 +879,12 @@ function extractTrailers(): TrailerData[] {
   for (const unit of units) {
     if (unit.type !== 'trailer_def') continue;
 
-    const fullName = unit.name.replace('trailer_def.', '');
+    const fullName = deriveTrailerIdFromDefName(unit.name);
     if (seenIds.has(fullName)) continue;
     seenIds.add(fullName);
 
     const countryValidity = (unit.props.country_validity as string[]) || [];
+    const p = pricing.get(fullName);
 
     trailers.push({
       id: fullName,
@@ -781,6 +900,8 @@ function extractTrailers(): TrailerData[] {
       chain_type: String(unit.props.chain_type || 'single'),
       country_validity: countryValidity,
       ownable: true, // trailer_defs are generally ownable; non-ownable are in trailer/ dir
+      price: p?.price ?? 0,
+      level_floor: p?.level_floor ?? 0,
     });
   }
 
@@ -1360,6 +1481,8 @@ function buildFrontendData(
       chain_type: t.chain_type,
       country_validity: t.country_validity.length > 0 ? t.country_validity : undefined,
       ownable: t.ownable,
+      price: t.price,
+      level_floor: t.level_floor,
     }])),
     companies: Object.fromEntries(companies.map(co => [co.id, {
       name: co.name,
@@ -1534,6 +1657,16 @@ function runDiff(newData: ReturnType<typeof buildFrontendData>): void {
       diffs.push(`gross_weight_limit: ${oldVal.gross_weight_limit} → ${newVal.gross_weight_limit}`);
     if (JSON.stringify(oldVal.country_validity) !== JSON.stringify(newVal.country_validity))
       diffs.push(`country_validity changed`);
+    // Pricing tracked for re-walk advisory: any non-zero ↔ zero transition or
+    // delta on a priced trailer signals a likely dealer-side rework, which
+    // means hand-walked HCT/customization-screen equivalents for the same
+    // brand+body_type should be re-verified.
+    const oldPrice = oldVal.price ?? 0;
+    const newPrice = newVal.price ?? 0;
+    if (oldPrice !== newPrice) diffs.push(`price: ${oldPrice} → ${newPrice}`);
+    const oldXp = oldVal.level_floor ?? 0;
+    const newXp = newVal.level_floor ?? 0;
+    if (oldXp !== newXp) diffs.push(`level_floor: ${oldXp} → ${newXp}`);
     return diffs.length > 0 ? diffs.join(', ') : null;
   }, (id) => {
     // New trailer: clean if brand is known, needs_input for new brands
@@ -1631,6 +1764,23 @@ function runDiff(newData: ReturnType<typeof buildFrontendData>): void {
     console.log(`--- REMOVED (${removed.length}) — content no longer in defs ---`);
     for (const c of removed) {
       console.log(`  - [${c.section}] ${c.id}: ${c.detail}`);
+    }
+    console.log('');
+  }
+
+  // Pricing-rework advisory: dealer-side price/xp shifts hint that customization-
+  // screen prices for related HCT/double variants of the same brand+body_type may
+  // also have changed. Surface these separately so the user knows which manual
+  // re-walks are warranted.
+  const pricingChanges = changes.filter(c =>
+    c.section === 'trailers' && c.type === 'changed'
+    && /(?:^|, )(price|level_floor):/.test(c.detail));
+  if (pricingChanges.length > 0) {
+    console.log(`--- PRICING CHANGES (${pricingChanges.length}) — re-walk advisory ---`);
+    console.log('Dealer pricing shifted on the trailers below. If you maintain hand-walked');
+    console.log('HCT/customization prices for the same brand+body_type, re-verify them.');
+    for (const c of pricingChanges) {
+      console.log(`  ~ [trailers] ${c.id}: ${c.detail}`);
     }
     console.log('');
   }

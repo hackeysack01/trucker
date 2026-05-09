@@ -48,6 +48,10 @@ export interface Trailer {
   chain_type: string;
   country_validity?: string[];
   ownable: boolean;
+  /** Total purchase price across all accessories, rounded UP to nearest 1000. 0 if no dealer data. */
+  price: number;
+  /** Max accessory unlock level — level at which the trailer becomes available. 0 if no dealer data. */
+  level_floor: number;
 }
 
 export interface GameDefs {
@@ -76,6 +80,8 @@ export interface GameDefs {
     chain_type: string;
     country_validity?: string[];
     ownable: boolean;
+    price: number;
+    level_floor: number;
   }>;
   cities: Record<string, {
     name: string;

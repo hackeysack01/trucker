@@ -57,11 +57,19 @@ export interface OptimalFleetEntry {
   ev: number;
   cargoMatched: number;
   count: number;           // 1-5 for drivers (collapsed by body type)
+  /** Per-trailer purchase price (rounded to nearest 1000); 0 if no dealer data. */
+  estimatedPrice: number;
+  /** Level at which this trailer becomes available (max accessory unlock); 0 if no dealer data. */
+  levelFloor: number;
 }
 
 export interface OptimalFleet {
   drivers: OptimalFleetEntry[];
   totalTrailers: number;
+  /** Sum of `estimatedPrice × count` across all drivers; 0 when no dealer data is present. */
+  totalEstimatedPrice: number;
+  /** Highest level floor across all recommended drivers — when the full fleet becomes ownable. */
+  fleetLevelFloor: number;
 }
 
 export interface CityRanking {
@@ -325,8 +333,15 @@ function bestJob(board: DepotCargoItem[], bodyType: string): { hv: number; idx: 
 // Body type display info (country-aware)
 // ============================================
 
+interface TrailerInfo {
+  trailerId: string;
+  trailerSpec: string;
+  estimatedPrice: number;
+  levelFloor: number;
+}
+
 /** Cache: country → bodyType → best trailer info */
-const trailerInfoCache = new Map<string, Map<string, { trailerId: string; trailerSpec: string }>>();
+const trailerInfoCache = new Map<string, Map<string, TrailerInfo>>();
 
 /** Clear trailer info cache — needed when DLC filter state changes between optimizer runs */
 export function clearTrailerInfoCache(): void {
@@ -340,15 +355,22 @@ export function clearTrailerInfoCache(): void {
  */
 function getTrailerInfoForCountry(
   country: string, data: AllData, lookups: Lookups,
-): Map<string, { trailerId: string; trailerSpec: string }> {
+): Map<string, TrailerInfo> {
   const cached = trailerInfoCache.get(country);
   if (cached) return cached;
 
-  const info = new Map<string, { trailerId: string; trailerSpec: string }>();
+  const info = new Map<string, TrailerInfo>();
+  // Best-EV trailer per body type, restricted to dealer-priced ownable
+  // trailers — keeps spec/EV/price/level consistent. HCT/double chains that
+  // aren't sold via dealer (player assembles them through the customization
+  // system, not a flat dealer file) are excluded; the recommendation reflects
+  // what the player can actually purchase. Once the player unlocks chain
+  // upgrades, the in-game customization replaces the single trailer.
   const bestByBT = new Map<string, { trailer: Trailer; totalHV: number }>();
 
   for (const t of data.trailers) {
     if (!t.ownable) continue;
+    if ((t.price ?? 0) <= 0) continue;
     if (t.country_validity && t.country_validity.length > 0
       && !t.country_validity.includes(country)) continue;
 
@@ -375,6 +397,8 @@ function getTrailerInfoForCountry(
     info.set(bt, {
       trailerId: trailer.id,
       trailerSpec: formatTrailerSpec(trailer),
+      estimatedPrice: trailer.price,
+      levelFloor: trailer.level_floor,
     });
   }
 
@@ -587,12 +611,16 @@ export function computeOptimalFleet(
       ev,
       cargoMatched: countCityCargoForBodyType(depots, bt),
       count,
+      estimatedPrice: info?.estimatedPrice ?? 0,
+      levelFloor: info?.levelFloor ?? 0,
     };
   });
 
   const totalTrailers = drivers.reduce((s, d) => s + d.count, 0);
+  const totalEstimatedPrice = drivers.reduce((s, d) => s + d.estimatedPrice * d.count, 0);
+  const fleetLevelFloor = drivers.reduce((m, d) => Math.max(m, d.levelFloor), 0);
 
-  return { drivers, totalTrailers };
+  return { drivers, totalTrailers, totalEstimatedPrice, fleetLevelFloor };
 }
 
 // ============================================
