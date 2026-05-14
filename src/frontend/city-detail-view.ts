@@ -97,7 +97,9 @@ export async function renderCity(
     return;
   }
 
-  const optimal = await computeFleetAsync(cityId, state.data, state.lookups);
+  // Use ranking-pass fleet for parity; fall back when direct nav skipped rankings.
+  const cachedFleet = state.cachedRankings?.find(r => r.id === cityId)?.fleet ?? null;
+  const optimal = cachedFleet ?? await computeFleetAsync(cityId, state.data, state.lookups);
   if (!optimal) {
     const emptyOwned = isOwnedGarage(cityId);
     cityContent.innerHTML = `

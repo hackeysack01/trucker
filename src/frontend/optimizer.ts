@@ -1,14 +1,11 @@
 /**
- * Trailer Set Optimizer for ETS2 Trucker Advisor
+ * Trailer Set Optimizer for ETS2 Trucker Advisor.
  *
- * Model: Best-of-N Monte Carlo fleet optimization
- * - Each depot independently spawns JOBS_PER_DEPOT random jobs from its cargo pool
- * - AI drivers see the combined job board and pick the highest-value job they can haul
- * - Fleet composition determined by greedy selection: each pick maximizes marginal EV
+ * Best-of-N Monte Carlo fleet optimization — depots spawn JOBS_PER_DEPOT random
+ * jobs, drivers greedy-pick the highest-value job they can haul. See CLAUDE.md
+ * "Key Algorithms" for model details and "City Ranking Score" for the rankings path.
  *
- * City rankings use an analytical E[max of N] formula for speed (no MC needed).
- *
- * Data source: game-defs.json (authoritative cargo values, spawn coefficients, trailer specs)
+ * Data source: game-defs.json.
  */
 
 import {
@@ -26,11 +23,11 @@ const MAX_DRIVERS = 5;
 /** Monte Carlo simulations for fleet computation (individual city) */
 const MC_SIMS = 20_000;
 
+/** MC count for city rankings. ~4-5% variance per per-driver-EV. Bump if picks shuffle between runs. */
+const RANKING_MC_SIMS = 500;
+
 /** Number of top trailers shown in rankings summary */
 const TOP_TRAILERS = 5;
-
-/** Drivers dispatched simultaneously for ranking score */
-const RANKING_DRIVERS = 5;
 
 // ============================================
 // Interfaces
@@ -60,6 +57,7 @@ export interface OptimalFleetEntry {
   bodyTypes: string[];
   trailerId: string;
   trailerSpec: string;
+  /** Mean per-driver EV across this profile's picks; multiply by `count` for total contribution. */
   ev: number;
   cargoMatched: number;
   count: number;           // 1-5 for drivers (collapsed by profile)
@@ -76,6 +74,8 @@ export interface OptimalFleet {
   totalEstimatedPrice: number;
   /** Highest level floor across all recommended drivers — when the full fleet becomes ownable. */
   fleetLevelFloor: number;
+  /** Sum of per-driver EVs after contention/stacking — the fleet's expected haul value per cycle. */
+  totalFleetEV: number;
 }
 
 export interface CityRanking {
@@ -89,6 +89,8 @@ export interface CityRanking {
   cargoTypes: number;
   score: number;
   topTrailers: FleetEntry[];
+  /** Cached fleet — detail view reads this for parity with the rankings column. */
+  fleet: OptimalFleet;
 }
 
 // ============================================
@@ -693,9 +695,17 @@ function countCityCargoForProfile(depots: CityDepotData[], bodyTypes: string[]):
  * Phase 3: Spare evaluation — for each candidate spare, compute expected
  *          improvement when ANY driver would benefit from swapping.
  */
+export interface ComputeFleetOptions {
+  /** Override MC sample count. Defaults to MC_SIMS (20k). Pass RANKING_MC_SIMS for city rankings. */
+  mcSims?: number;
+}
+
 export function computeOptimalFleet(
   cityId: string, data: AllData, lookups: Lookups,
+  opts?: ComputeFleetOptions,
 ): OptimalFleet | null {
+  const mcSims = opts?.mcSims ?? MC_SIMS;
+
   // Seed PRNG from city ID for deterministic results
   rng = mulberry32(hashString(cityId));
 
@@ -741,13 +751,17 @@ export function computeOptimalFleet(
   const totalSlots = depots.length * JOBS_PER_DEPOT;
   const boardBuffer: DepotCargoItem[] = new Array(totalSlots);
 
-  // Phase 1: Greedy driver selection by profile (body-type set + rep trailer)
+  // Phase 1: Greedy driver selection by profile (body-type set + rep trailer).
+  // Stacking is allowed — a profile already in `fleet` is still evaluated against
+  // the residual board, because a second pick of the same profile picks the
+  // next-best job (not the same one). The greedy keeps stacking only while
+  // marginal EV exceeds every other candidate's residual.
   const fleet: Array<{ key: string; bodyTypes: string[]; repId: string }> = [];
 
   for (let pick = 0; pick < MAX_DRIVERS; pick++) {
     // Generate shared boards for this round
     const rawBoards: DepotCargoItem[][] = [];
-    for (let s = 0; s < MC_SIMS; s++) {
+    for (let s = 0; s < mcSims; s++) {
       const len = fillBoard(boardBuffer, depots);
       rawBoards.push(boardBuffer.slice(0, len));
     }
@@ -774,7 +788,7 @@ export function computeOptimalFleet(
       for (const remaining of baseRemainders) {
         marginalSum += bestJobForRep(remaining, cand.repId).hv;
       }
-      const marginal = marginalSum / MC_SIMS;
+      const marginal = marginalSum / mcSims;
       if (marginal > bestMarginal) {
         bestMarginal = marginal;
         bestProfile = { key: cand.key, bodyTypes: cand.bodyTypes, repId: cand.repId };
@@ -790,7 +804,7 @@ export function computeOptimalFleet(
   // Phase 2: Compute per-driver EVs with final fleet
   const driverEVs = new Array(fleet.length).fill(0);
 
-  for (let s = 0; s < MC_SIMS; s++) {
+  for (let s = 0; s < mcSims; s++) {
     const len = fillBoard(boardBuffer, depots);
     const remaining = boardBuffer.slice(0, len);
     for (let d = 0; d < fleet.length; d++) {
@@ -803,21 +817,27 @@ export function computeOptimalFleet(
     }
   }
 
-  for (let d = 0; d < fleet.length; d++) driverEVs[d] /= MC_SIMS;
+  for (let d = 0; d < fleet.length; d++) driverEVs[d] /= mcSims;
 
-  // Collapse fleet into counts by profile key
-  const driverMap = new Map<string, { ev: number; count: number; bodyTypes: string[] }>();
+  // True fleet EV (sum of per-driver EVs) — used as ranking score below.
+  const totalFleetEV = driverEVs.reduce((s, e) => s + e, 0);
+
+  // Collapse fleet into counts by profile key. For stacked profiles, accumulate
+  // each instance's per-driver EV and average at the end — first-pick alone is
+  // misleading because picks 2+ of the same profile earn meaningfully less.
+  const driverMap = new Map<string, { evSum: number; count: number; bodyTypes: string[] }>();
   for (let d = 0; d < fleet.length; d++) {
     const driver = fleet[d];
     const existing = driverMap.get(driver.key);
     if (existing) {
+      existing.evSum += driverEVs[d];
       existing.count++;
     } else {
-      driverMap.set(driver.key, { ev: driverEVs[d], count: 1, bodyTypes: driver.bodyTypes });
+      driverMap.set(driver.key, { evSum: driverEVs[d], count: 1, bodyTypes: driver.bodyTypes });
     }
   }
 
-  const drivers: OptimalFleetEntry[] = [...driverMap.entries()].map(([key, { ev, count, bodyTypes }]) => {
+  const drivers: OptimalFleetEntry[] = [...driverMap.entries()].map(([key, { evSum, count, bodyTypes }]) => {
     const info = profileInfo.get(key);
     const primary = bodyTypes[0];
     const cargoMatched = countCityCargoForProfile(depots, bodyTypes);
@@ -827,7 +847,7 @@ export function computeOptimalFleet(
       bodyTypes,
       trailerId: info?.trailerId ?? primary,
       trailerSpec: info?.trailerSpec ?? primary,
-      ev,
+      ev: evSum / count,
       cargoMatched,
       count,
       estimatedPrice: info?.estimatedPrice ?? 0,
@@ -839,64 +859,29 @@ export function computeOptimalFleet(
   const totalEstimatedPrice = drivers.reduce((s, d) => s + d.estimatedPrice * d.count, 0);
   const fleetLevelFloor = drivers.reduce((m, d) => Math.max(m, d.levelFloor), 0);
 
-  return { drivers, totalTrailers, totalEstimatedPrice, fleetLevelFloor };
+  return { drivers, totalTrailers, totalEstimatedPrice, fleetLevelFloor, totalFleetEV };
 }
 
 // ============================================
 // City rankings (analytical)
 // ============================================
 
-/**
- * Rank all cities by total earning potential using analytical E[max of N].
- *
- * Score = sum of top RANKING_DRIVERS profiles' analytical first-pick EVs.
- * Profile-aware so multi-body trailers credit toward the city's score
- * (a `[flatbed, container]` trailer counts as a candidate that competes in
- * both pools, matching what `computeOptimalFleet` would actually pick).
- */
+/** Rank all cities by greedy fleet EV. See CLAUDE.md "City Ranking Score". */
 export function calculateCityRankings(
   data: AllData, lookups: Lookups,
 ): CityRanking[] {
   const rankings: CityRanking[] = [];
 
   for (const city of data.cities) {
+    const fleet = computeOptimalFleet(city.id, data, lookups, { mcSims: RANKING_MC_SIMS });
+    if (!fleet || fleet.drivers.length === 0) continue;
+
     const depots = buildCityDepotProfiles(city.id, lookups);
     if (!depots) continue;
-
-    const profileInfo = getProfileTrailerInfoForCountry(city.country, data, lookups);
 
     const cityCompanies = lookups.cityCompanyMap.get(city.id) || [];
     let depotCount = 0;
     for (const { count } of cityCompanies) depotCount += count;
-
-    // Body types present in this city's depots; domination still computed at
-    // body-type level (cargo-coverage relation is a single-bt notion).
-    const allBodyTypes = new Set<string>();
-    for (const depot of depots) {
-      for (const c of depot.cargo) {
-        for (const bt of Object.keys(c.bodyHV)) allBodyTypes.add(bt);
-      }
-    }
-
-    const dominated = findDominatedBodyTypes(depots, allBodyTypes);
-    const depotItemsCache = buildDepotItemsCache(depots);
-
-    // Per profile: analytical first-pick EV over the profile's surviving (non-dominated, present) body types.
-    // Use rep-HV (same as fleet picker) so top-N picks match.
-    const profileEVs: Array<{ key: string; bodyTypes: string[]; ev: number }> = [];
-    for (const [key, info] of profileInfo) {
-      const surviving = info.bodyTypes.filter((bt) => allBodyTypes.has(bt) && !dominated.has(bt));
-      if (surviving.length === 0) continue;
-      const ev = analyticalFirstPickEVForRep(depots, info.trailerId, lookups, depotItemsCache);
-      if (ev > 0) profileEVs.push({ key, bodyTypes: surviving, ev });
-    }
-    profileEVs.sort((a, b) => b.ev - a.ev);
-
-    if (profileEVs.length === 0) continue;
-
-    // Score = sum of top N profile EVs
-    const topN = profileEVs.slice(0, RANKING_DRIVERS);
-    const score = topN.reduce((s, e) => s + e.ev, 0);
 
     // Count unique cargo types across all depots
     const cargoIds = new Set<string>();
@@ -904,24 +889,27 @@ export function calculateCityRankings(
       for (const c of depot.cargo) cargoIds.add(c.cargoId);
     }
 
-    // Build top trailer entries for display
-    const topTrailers: FleetEntry[] = profileEVs.slice(0, TOP_TRAILERS).map((e) => {
-      const info = profileInfo.get(e.key);
-      const primary = e.bodyTypes[0];
-      return {
-        trailerId: info?.trailerId ?? primary,
-        bodyType: primary,
-        bodyTypes: e.bodyTypes,
+    const score = fleet.totalFleetEV;
+
+    // Top trailers = the actual fleet picks (pick order ≈ EV desc, but sort
+    // explicitly by per-profile fleet contribution to honour the rankings
+    // table's "sorted by cityValue desc" contract).
+    const topTrailers: FleetEntry[] = fleet.drivers
+      .map<FleetEntry>((d) => ({
+        trailerId: d.trailerId,
+        bodyType: d.bodyType,
+        bodyTypes: d.bodyTypes,
         chainType: 'single',
         countryValidity: [],
-        displayName: profileDisplayName(e.bodyTypes),
-        trailerSpec: info?.trailerSpec ?? primary,
-        cityValue: e.ev,
-        pctOfTotal: score > 0 ? (e.ev / score) * 100 : 0,
-        cargoMatched: countCityCargoForProfile(depots, e.bodyTypes),
-        variants: 1,
-      };
-    });
+        displayName: d.displayName,
+        trailerSpec: d.trailerSpec,
+        cityValue: d.ev * d.count,
+        pctOfTotal: score > 0 ? (d.ev * d.count / score) * 100 : 0,
+        cargoMatched: d.cargoMatched,
+        variants: d.count,
+      }))
+      .sort((a, b) => b.cityValue - a.cityValue)
+      .slice(0, TOP_TRAILERS);
 
     rankings.push({
       id: city.id,
@@ -934,6 +922,7 @@ export function calculateCityRankings(
       cargoTypes: cargoIds.size,
       score,
       topTrailers,
+      fleet,
     });
   }
 
