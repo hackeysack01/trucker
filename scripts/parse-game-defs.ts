@@ -1404,6 +1404,8 @@ function main() {
   const parsedTrailers = extractTrailers();
   console.log(`  Found ${parsedTrailers.length} trailer definitions`);
 
+  // Load-bearing: parser cannot recover chain_base or per-chassis body fees.
+  // See docs/manual-prices-audit.md → "Why the parser alone is insufficient".
   const manualMerge = mergeManualPrices(parsedTrailers, manualPricesPath, game);
   const trailers = manualMerge.trailers;
   if (manualMerge.applied > 0) {

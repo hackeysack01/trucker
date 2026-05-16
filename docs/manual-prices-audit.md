@@ -1,7 +1,5 @@
 # manual-prices.json — methodology, audit, walk queue
 
-> **DEPRECATED** — As of PR #264 (2026-05-15), the parser reads exact trailer prices directly from game defs. Manual walks are no longer needed. This file and `manual-prices.json` will be removed in a follow-up cleanup PR.
-
 ## SCS internal name → dealer UI label
 
 Internal body suffixes in the trailer keys don't match what the in-game dealer screen calls them. Quick reference for walks:
@@ -27,6 +25,10 @@ Internal body suffixes in the trailer keys don't match what the in-game dealer s
 | `steel` (log) | Steel floor logger |
 
 ## Walk methodology
+
+### Why the parser alone is insufficient
+
+`extractTrailerPricing()` in `parse-game-defs.ts` walks the dealer-accessory entries in the game defs but cannot recover `chain_base` (a per-brand/chain constant) or the per-chassis `body_fee` scaling — both of which are only visible on the live in-game dealer screen. Without `mergeManualPrices()` applying the walked overrides, ~368 trailers price as 0 and another ~70 underestimate by €5k–€55k. The manual walk queue is load-bearing for any trailer that participates in a winner-tie group.
 
 For each trailer key, record the **cheapest configured-trailer total** the dealer screen shows when every selectable section (chassis / body / paint / wheels / accessories) is set to its lowest-priced option. This becomes the entry's `price`.
 
